@@ -272,9 +272,14 @@ export async function POST(req: NextRequest) {
             if (composioTools && Object.keys(composioTools).length > 0) {
                 const interceptedTools: any = {};
                 for (const [toolName, toolConfig] of Object.entries(composioTools)) {
-                    if (isRiskyTool(toolName) && (toolConfig as any).execute) {
+                    const mappedTool = {
+                        ...(toolConfig as any),
+                        parameters: (toolConfig as any).inputSchema || (toolConfig as any).parameters
+                    };
+
+                    if (isRiskyTool(toolName) && mappedTool.execute) {
                         interceptedTools[toolName] = {
-                            ...(toolConfig as any),
+                            ...mappedTool,
                             execute: async (args: any) => {
                                 const contentPayload = JSON.stringify({ toolName, args, chatId });
                                 const docRes = await client.add({
@@ -286,7 +291,7 @@ export async function POST(req: NextRequest) {
                             }
                         };
                     } else {
-                        interceptedTools[toolName] = toolConfig;
+                        interceptedTools[toolName] = mappedTool;
                     }
                 }
                 tools = interceptedTools;
