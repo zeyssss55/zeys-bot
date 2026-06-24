@@ -296,7 +296,7 @@ export async function POST(req: NextRequest) {
         }
 
         const systemPrompt = `You are a helpful Telegram AI Assistant.
-You have access to tools via Composio (Gmail, GitHub, Google Calendar) to perform tasks.
+You have access to tools via Composio (Gmail, GitHub, Google Calendar, Spotify, Notion) to perform tasks.
 You also have a memory of past interactions. Here is the recalled context:
 ${memoryContext || "None"}
 
