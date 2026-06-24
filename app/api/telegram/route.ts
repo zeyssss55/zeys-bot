@@ -1,8 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import { generateText } from "ai";
-import { remember, recall } from "@/lib/memory";
+import { remember, recall, client } from "@/lib/memory";
 import { getTools } from "@/lib/composio";
 import { google } from "@ai-sdk/google";
+
+class PendingApprovalError extends Error {
+    constructor() {
+        super("Pending approval");
+        this.name = "PendingApprovalError";
+    }
+}
+
+const RISKY_TOOL_KEYWORDS = [
+    "send", "create", "delete", "update", "write", "patch", "post", "put", "close", "merge", "cancel", "star"
+];
+
+function isRiskyTool(toolName: string): boolean {
+    return RISKY_TOOL_KEYWORDS.some(kw => toolName.toLowerCase().includes(kw));
+}
 
 async function sendTelegramMessage(chatId: number, text: string) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
@@ -10,7 +25,7 @@ async function sendTelegramMessage(chatId: number, text: string) {
         console.error("TELEGRAM_BOT_TOKEN is not defined in env variables");
         return;
     }
-
+    
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
     const response = await fetch(url, {
         method: "POST",
@@ -28,11 +43,82 @@ async function sendTelegramMessage(chatId: number, text: string) {
     }
 }
 
+async function sendTelegramApprovalRequest(chatId: number, toolName: string, args: any, docId: string) {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!token) return;
+
+    const text = `⚠️ *Aksi Berisiko Terdeteksi!*\n\n*Alat:* \`${toolName}\`\n*Parameter:* \`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\`\n\nApakah Anda menyetujui aksi ini?`;
+    
+    const url = `https://api.telegram.org/bot${token}/sendMessage`;
+    const response = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            chat_id: chatId,
+            text: text,
+            parse_mode: "Markdown",
+            reply_markup: {
+                inline_keyboard: [
+                    [
+                        { text: "✅ Setuju (Approve)", callback_data: `approve:${docId}` },
+                        { text: "❌ Tolak (Reject)", callback_data: `reject:${docId}` }
+                    ]
+                ]
+            }
+        }),
+    });
+
+    if (!response.ok) {
+        console.error("Failed to send approval request to Telegram:", await response.text());
+    }
+}
+
+async function editTelegramMessage(chatId: number, messageId: number, text: string) {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!token) return;
+
+    const url = `https://api.telegram.org/bot${token}/editMessageText`;
+    const response = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId,
+            text: text,
+            parse_mode: "Markdown",
+        }),
+    });
+
+    if (!response.ok) {
+        console.error("Failed to edit Telegram message:", await response.text());
+    }
+}
+
+async function answerCallbackQuery(callbackQueryId: string, text?: string) {
+    const token = process.env.TELEGRAM_BOT_TOKEN;
+    if (!token) return;
+
+    const url = `https://api.telegram.org/bot${token}/answerCallbackQuery`;
+    await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+            callback_query_id: callbackQueryId,
+            ...(text ? { text } : {})
+        }),
+    });
+}
+
 export async function POST(req: NextRequest) {
     let chatId: number | undefined;
 
     try {
-        // 1. Verify secret token if configured
         const expectedSecret = process.env.TELEGRAM_SECRET_TOKEN;
         const receivedSecret = req.headers.get("x-telegram-bot-api-secret-token");
         if (expectedSecret && receivedSecret !== expectedSecret) {
@@ -40,9 +126,91 @@ export async function POST(req: NextRequest) {
         }
 
         const body = await req.json();
-        const message = body.message;
 
-        // Check if the update contains a message and message text
+        // --- HANDLE CALLBACK QUERY (Approve/Reject buttons) ---
+        if (body.callback_query) {
+            const callbackQuery = body.callback_query;
+            const callbackQueryId = callbackQuery.id;
+            const data = callbackQuery.data; // approve:docId or reject:docId
+            chatId = callbackQuery.message?.chat?.id;
+            const messageId = callbackQuery.message?.message_id;
+
+            if (!data || !chatId || !messageId) {
+                await answerCallbackQuery(callbackQueryId, "Gagal memproses tombol.");
+                return NextResponse.json({ ok: true });
+            }
+
+            const [action, docId] = data.split(":");
+            if (!action || !docId) {
+                await answerCallbackQuery(callbackQueryId, "Parameter tombol tidak valid.");
+                return NextResponse.json({ ok: true });
+            }
+
+            if (action === "reject") {
+                await Promise.all([
+                    editTelegramMessage(chatId, messageId, "❌ *Aksi telah ditolak dan dibatalkan.*"),
+                    client.documents.delete(docId).catch(err => console.error("Error deleting doc:", err)),
+                    answerCallbackQuery(callbackQueryId, "Aksi dibatalkan.")
+                ]);
+                return NextResponse.json({ ok: true });
+            }
+
+            if (action === "approve") {
+                let doc: any;
+                try {
+                    doc = await client.documents.get(docId);
+                } catch (err) {
+                    console.error("Failed to fetch pending action:", err);
+                    await editTelegramMessage(chatId, messageId, "❌ *Aksi kedaluwarsa atau tidak ditemukan.*");
+                    await answerCallbackQuery(callbackQueryId, "Aksi kedaluwarsa.");
+                    return NextResponse.json({ ok: true });
+                }
+
+                if (!doc || !doc.content) {
+                    await editTelegramMessage(chatId, messageId, "❌ *Data aksi kosong atau tidak valid.*");
+                    await answerCallbackQuery(callbackQueryId, "Data tidak valid.");
+                    return NextResponse.json({ ok: true });
+                }
+
+                const { toolName, args } = JSON.parse(doc.content);
+                const userId = chatId.toString();
+
+                await editTelegramMessage(chatId, messageId, "⏳ *Aksi disetujui, sedang mengeksekusi...*");
+
+                const tools = await getTools(userId);
+                const tool = tools[toolName];
+
+                if (!tool || !tool.execute) {
+                    await editTelegramMessage(chatId, messageId, `❌ *Tool \`${toolName}\` tidak ditemukan atau tidak dapat dieksekusi.*`);
+                    await answerCallbackQuery(callbackQueryId, "Eksekusi gagal.");
+                    return NextResponse.json({ ok: true });
+                }
+
+                try {
+                    const result = await (tool.execute as any)(args);
+                    const resultText = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+                    
+                    await editTelegramMessage(
+                        chatId, 
+                        messageId, 
+                        `✅ *Aksi berhasil dieksekusi!*\n\n*Hasil:* \`\`\`json\n${resultText.substring(0, 1000)}\n\`\`\``
+                    );
+                    await answerCallbackQuery(callbackQueryId, "Aksi sukses dijalankan!");
+                } catch (err: any) {
+                    console.error("Error executing tool:", err);
+                    await editTelegramMessage(chatId, messageId, `❌ *Eksekusi gagal:* ${err.message || err}`);
+                    await answerCallbackQuery(callbackQueryId, "Eksekusi error.");
+                }
+
+                await client.documents.delete(docId).catch(err => console.error("Error deleting doc:", err));
+                return NextResponse.json({ ok: true });
+            }
+
+            return NextResponse.json({ ok: true });
+        }
+
+        // --- HANDLE STANDARD MESSAGE ---
+        const message = body.message;
         if (!message) {
             return NextResponse.json({ ok: true });
         }
@@ -75,7 +243,26 @@ export async function POST(req: NextRequest) {
 
             memoryContext = recalledContext;
             if (composioTools && Object.keys(composioTools).length > 0) {
-                tools = composioTools;
+                const interceptedTools: any = {};
+                for (const [toolName, toolConfig] of Object.entries(composioTools)) {
+                    if (isRiskyTool(toolName) && (toolConfig as any).execute) {
+                        interceptedTools[toolName] = {
+                            ...(toolConfig as any),
+                            execute: async (args: any) => {
+                                const contentPayload = JSON.stringify({ toolName, args, chatId });
+                                const docRes = await client.add({
+                                    content: contentPayload,
+                                    containerTag: `pending_approval_${userId}`
+                                });
+                                await sendTelegramApprovalRequest(chatId!, toolName, args, docRes.id);
+                                throw new PendingApprovalError();
+                            }
+                        };
+                    } else {
+                        interceptedTools[toolName] = toolConfig;
+                    }
+                }
+                tools = interceptedTools;
             }
         } catch (err) {
             console.error("Error in parallel setup:", err);
@@ -99,7 +286,7 @@ Please respond concisely since the user is reading your messages on Telegram. Ke
         // 4. Reply to user as early as possible
         await sendTelegramMessage(chatId, aiResponse);
 
-        // 5. Save this conversation turn to memory in the background (awaited before return to ensure execution)
+        // 5. Save this conversation turn to memory in the background
         try {
             await remember(userId, `User: ${userText}\nAssistant: ${aiResponse}`);
         } catch (err) {
@@ -108,9 +295,13 @@ Please respond concisely since the user is reading your messages on Telegram. Ke
 
         return NextResponse.json({ ok: true });
     } catch (error) {
+        if (error instanceof PendingApprovalError) {
+            console.log("Halted tool calling loop for user approval.");
+            return NextResponse.json({ ok: true });
+        }
+
         console.error("Error in Telegram route handler:", error);
 
-        // Attempt to report error back to the user if we can retrieve chatId
         if (chatId) {
             try {
                 await sendTelegramMessage(chatId, "Sorry, I encountered an error while processing your request.");
