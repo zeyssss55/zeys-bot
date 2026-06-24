@@ -303,19 +303,43 @@ ${memoryContext || "None"}
 Please respond concisely since the user is reading your messages on Telegram. Keep formatting clean.`;
 
         // 3. Run the AI agent
+        console.log(`Processing message from ${userId}: "${userText}"`);
         const { text: aiResponse } = await generateText({
             model: google("gemini-2.5-flash"),
             system: systemPrompt,
             prompt: userText,
             ...(tools ? { tools, maxSteps: 10 } : {}),
+            onStepFinish({ text, toolCalls, toolResults, finishReason }: any) {
+                console.log("Step finished. Text:", text);
+                console.log("Tool calls:", JSON.stringify(toolCalls));
+                console.log("Tool results count:", toolResults?.length);
+                if (toolResults && toolResults.length > 0) {
+                    // Log clean tool results summary (without huge content if any)
+                    const cleanResults = toolResults.map((r: any) => ({
+                        toolName: r.toolName,
+                        args: r.args,
+                        type: r.type,
+                        resultSummary: typeof r.result === "string" ? r.result.substring(0, 100) : "object"
+                    }));
+                    console.log("Tool results summary:", JSON.stringify(cleanResults));
+                }
+                console.log("Finish reason:", finishReason);
+            }
         } as any);
 
+        console.log(`AI Response for ${userId}: "${aiResponse}"`);
+
         // 4. Reply to user as early as possible
-        await sendTelegramMessage(chatId, aiResponse);
+        if (!aiResponse || aiResponse.trim() === "") {
+            console.warn("AI response was empty. Sending fallback message.");
+            await sendTelegramMessage(chatId, "Maaf, saya tidak menerima respons tertulis dari asisten. Silakan coba lagi.");
+        } else {
+            await sendTelegramMessage(chatId, aiResponse);
+        }
 
         // 5. Save this conversation turn to memory in the background
         try {
-            await remember(userId, `User: ${userText}\nAssistant: ${aiResponse}`);
+            await remember(userId, `User: ${userText}\nAssistant: ${aiResponse || "No response"}`);
         } catch (err) {
             console.error("Error saving memory:", err);
         }
