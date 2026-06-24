@@ -10,6 +10,6 @@ export const composio = new Composio({
 // Ambil tools utk user tertentu (userId = chat id Telegram, misalnya)
 export async function getTools(userId: string) {
     return composio.tools.get(userId, {
-        toolkits: ["GMAIL", "GITHUB", "GOOGLECALENDAR"],
+        toolkits: ["GMAIL", "GITHUB", "GOOGLECALENDAR", "SPOTIFY", "NOTION"],
     })
 }
