@@ -127,6 +127,33 @@ export async function POST(req: NextRequest) {
 
         const body = await req.json();
 
+        // Extract sender Telegram ID
+        let senderId: number | undefined;
+        if (body.callback_query) {
+            senderId = body.callback_query.from?.id;
+            chatId = body.callback_query.message?.chat?.id;
+        } else if (body.message) {
+            senderId = body.message.from?.id;
+            chatId = body.message.chat?.id;
+        }
+
+        // Whitelist check
+        const allowedIdsEnv = process.env.ALLOWED_TELEGRAM_USER_IDS;
+        if (allowedIdsEnv && senderId) {
+            const allowedIds = allowedIdsEnv.split(",").map(id => id.trim());
+            if (!allowedIds.includes(senderId.toString())) {
+                console.warn(`Unauthorized access attempt from Telegram ID: ${senderId}`);
+                if (chatId) {
+                    if (body.callback_query) {
+                        await answerCallbackQuery(body.callback_query.id, "Akses ditolak.");
+                    } else {
+                        await sendTelegramMessage(chatId, "⚠️ Akses ditolak. Anda tidak terdaftar untuk menggunakan bot ini.");
+                    }
+                }
+                return NextResponse.json({ ok: true });
+            }
+        }
+
         // --- HANDLE CALLBACK QUERY (Approve/Reject buttons) ---
         if (body.callback_query) {
             const callbackQuery = body.callback_query;
